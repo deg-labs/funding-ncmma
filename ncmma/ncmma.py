@@ -272,9 +272,42 @@ class CmmaFundingRateMonitor:
             rate_percent = f"{rate:+.4%}"
             symbol = item['symbol']
             
+            # Extract additional info
+            constraints = item.get('constraints', {})
+            interval_hours = constraints.get('interval_hours')
+            next_funding_ts = item.get('next_funding_ts')
+            
             icon = "📈" if rate > 0 else "📉"
             
             value_text = f"**Rate: `{rate_percent}`**"
+            
+            # Interval
+            if interval_hours:
+                value_text += f" (Intv: `{interval_hours}h`)"
+            
+            # Next Funding Time (JST) & Countdown
+            if next_funding_ts:
+                try:
+                    ts_sec = next_funding_ts / 1000
+                    # UTC datetime
+                    dt_utc = datetime.utcfromtimestamp(ts_sec)
+                    # JST datetime (UTC+9)
+                    dt_jst = dt_utc + timedelta(hours=9)
+                    jst_str = dt_jst.strftime('%H:%M')
+                    
+                    # Countdown
+                    now_utc = datetime.utcnow()
+                    diff = dt_utc - now_utc
+                    if diff.total_seconds() > 0:
+                        hours = int(diff.total_seconds() // 3600)
+                        minutes = int((diff.total_seconds() % 3600) // 60)
+                        countdown = f"{hours}h{minutes:02d}m"
+                    else:
+                        countdown = "Now"
+                        
+                    value_text += f"\nNext: `{jst_str} JST` (あと `{countdown}`)"
+                except Exception:
+                    pass
             
             if stats:
                 total = stats.get('total_hit_rate', 0)

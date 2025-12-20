@@ -75,7 +75,7 @@ docker-compose up --build -d
 ### 3. 動作確認
 ログを確認して動作状況をチェックします。
 ```shell
-docker-compose logs -f volatility-ncmma-notifier
+docker-compose logs -f funding-ncmma-notifier
 ```
 
 ## アプリケーションの停止
