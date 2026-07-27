@@ -306,8 +306,12 @@ class CmmaFundingRateMonitor:
                         countdown = "Now"
                         
                     value_text += f"\nNext: `{jst_str} JST` (あと `{countdown}`)"
-                except Exception:
-                    pass
+                except (TypeError, ValueError, OverflowError):
+                    self.logger.warning(
+                        "Failed to format next funding time for symbol=%s",
+                        symbol,
+                        exc_info=True,
+                    )
             
             if stats:
                 total = stats.get('total_hit_rate', 0)
