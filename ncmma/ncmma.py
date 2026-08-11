@@ -155,7 +155,7 @@ class CmmaFundingRateMonitor:
                 return True
         except sqlite3.Error as e:
             self.logger.error(f"Failed to check notification history from DB: {e}")
-            return False # DBエラー時は通知しない
+            return True # DBエラー時は通知を許可し、金融アラートの喪失を防ぐ
 
     def _record_notification(self, notification_hash, symbol, rate, direction):
         """通知履歴をDBに記録"""
