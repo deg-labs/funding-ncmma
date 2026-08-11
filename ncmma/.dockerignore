@@ -1,0 +1,12 @@
+# 秘密情報を含む .env や不要ファイルをビルドコンテキストから除外し、
+# イメージレイヤに焼き込まれないようにする (docker history からの漏洩防止)
+.env
+.env.*
+!.env.example
+logs/
+cache/
+data/
+__pycache__/
+*.pyc
+*.db
+.git/
