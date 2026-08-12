@@ -153,7 +153,7 @@ class CmmaFundingRateMonitor:
                     if time_diff.total_seconds() < self.renotify_buffer_minutes * 60:
                         return False
                 return True
-        except sqlite3.Error as e:
+        except (sqlite3.Error, ValueError, TypeError) as e:
             self.logger.error(f"Failed to check notification history from DB: {e}")
             return True # DBエラー時は通知を許可し、金融アラートの喪失を防ぐ
 
