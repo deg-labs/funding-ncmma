@@ -8,8 +8,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
-COPY . .
+# Copy the application code only.
+# Secrets such as .env (Discord webhook) must NOT be baked into the image;
+# they are injected at runtime via env_file in docker-compose.yml.
+COPY ncmma.py .
 
 # Command to run the application
 CMD ["python", "ncmma.py"]
