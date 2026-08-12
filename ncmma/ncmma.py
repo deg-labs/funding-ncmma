@@ -12,6 +12,7 @@ import time
 import sys
 import os
 import hashlib
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -244,12 +245,21 @@ class CmmaFundingRateMonitor:
                 continue
 
             rate = funding.get('rate')
-            if not isinstance(rate, (int, float)):
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)):
                 self.logger.warning(f"Skipping invalid candidate (missing/invalid funding rate): {item!r}")
                 continue
 
+            try:
+                rate_value = float(rate)
+            except (OverflowError, TypeError, ValueError):
+                self.logger.warning(f"Skipping invalid candidate (unconvertible funding rate): {item!r}")
+                continue
+            if not math.isfinite(rate_value):
+                self.logger.warning(f"Skipping invalid candidate (non-finite funding rate): {item!r}")
+                continue
+
             # レートの正負から方向を判定
-            item_direction = 'positive' if rate > 0 else 'negative'
+            item_direction = 'positive' if rate_value > 0 else 'negative'
             
             # フィルタリング
             notif_hash = self._generate_notification_hash(symbol, item_direction)
