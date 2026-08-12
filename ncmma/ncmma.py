@@ -12,6 +12,7 @@ import time
 import sys
 import os
 import hashlib
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -185,12 +186,15 @@ class CmmaFundingRateMonitor:
             response.raise_for_status()
             
             data = response.json()
-            if 'data' in data:
-                self.logger.info(f"Fetched {len(data['data'])} abnormal funding rates.")
-                return data['data']
-            else:
-                self.logger.warning(f"Unexpected response format: {data}")
+            if not isinstance(data, dict):
+                self.logger.warning(f"Unexpected response format (not an object): {data!r}")
                 return []
+            items = data.get('data')
+            if not isinstance(items, list):
+                self.logger.warning(f"Unexpected response format ('data' is not a list): {data!r}")
+                return []
+            self.logger.info(f"Fetched {len(items)} abnormal funding rates.")
+            return items
 
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Request error while fetching funding rates: {e}")
@@ -227,13 +231,35 @@ class CmmaFundingRateMonitor:
         if not candidates or not self.discord_webhook_url:
             return False
         
-        # 通知対象をフィルタリング
+        # 通知対象をフィルタリング (外部API由来データのため、構造を検証して不正要素はスキップ)
         notifications = []
         for item in candidates:
-            symbol = item['symbol']
-            rate = item['funding']['rate']
+            if not isinstance(item, dict):
+                self.logger.warning(f"Skipping invalid candidate (not an object): {item!r}")
+                continue
+
+            symbol = item.get('symbol')
+            funding = item.get('funding')
+            if not isinstance(symbol, str) or not isinstance(funding, dict):
+                self.logger.warning(f"Skipping invalid candidate (missing/invalid symbol or funding): {item!r}")
+                continue
+
+            rate = funding.get('rate')
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+                self.logger.warning(f"Skipping invalid candidate (missing/invalid funding rate): {item!r}")
+                continue
+
+            try:
+                rate_value = float(rate)
+            except (OverflowError, TypeError, ValueError):
+                self.logger.warning(f"Skipping invalid candidate (unconvertible funding rate): {item!r}")
+                continue
+            if not math.isfinite(rate_value):
+                self.logger.warning(f"Skipping invalid candidate (non-finite funding rate): {item!r}")
+                continue
+
             # レートの正負から方向を判定
-            item_direction = 'positive' if rate > 0 else 'negative'
+            item_direction = 'positive' if rate_value > 0 else 'negative'
             
             # フィルタリング
             notif_hash = self._generate_notification_hash(symbol, item_direction)
@@ -244,7 +270,7 @@ class CmmaFundingRateMonitor:
                     'item': item,
                     'hash': notif_hash,
                     'direction': item_direction,
-                    'stats': continuity_data.get('stats') if continuity_data else None
+                    'stats': continuity_data.get('stats') if isinstance(continuity_data, dict) else None
                 })
 
         if not notifications:
