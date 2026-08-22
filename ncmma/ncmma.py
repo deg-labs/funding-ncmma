@@ -81,6 +81,15 @@ class CmmaFundingRateMonitor:
         )  # デフォルト4時間
         self.check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
+        # Discordメッセージ保持設定
+        self.discord_keep_messages = int(os.getenv("DISCORD_KEEP_MESSAGES", "50"))
+        self.discord_cleanup_interval_hours = int(
+            os.getenv("DISCORD_CLEANUP_INTERVAL_HOURS", "24")
+        )
+        self.discord_delete_interval_seconds = float(
+            os.getenv("DISCORD_DELETE_INTERVAL_SECONDS", "0.5")
+        )
+
         # ログ設定
         self.log_max_size_mb = int(os.getenv("LOG_MAX_SIZE_MB", "10"))
 
@@ -98,6 +107,18 @@ class CmmaFundingRateMonitor:
                         rate REAL NOT NULL,
                         direction TEXT NOT NULL,
                         notified_at TIMESTAMP NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS discord_messages (
+                        message_id TEXT PRIMARY KEY,
+                        posted_at TIMESTAMP NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
                     )
                 """)
                 conn.commit()
@@ -187,6 +208,139 @@ class CmmaFundingRateMonitor:
                 conn.commit()
         except sqlite3.Error as e:
             self.logger.error(f"Failed to record notification to DB: {e}")
+
+    def _discord_post_url(self):
+        """wait=true を付けた投稿用URLを返す (レスポンスからメッセージIDを取得するために必要)"""
+        base, sep, query = self.discord_webhook_url.partition("?")
+        if sep:
+            return f"{base}?{query}&wait=true"
+        return f"{base}?wait=true"
+
+    def _discord_delete_url(self, message_id):
+        """webhookが投稿したメッセージを削除するURLを返す"""
+        base, sep, query = self.discord_webhook_url.partition("?")
+        url = f"{base}/messages/{message_id}"
+        return f"{url}?{query}" if sep else url
+
+    def _record_discord_message(self, message_id):
+        """投稿したDiscordメッセージのIDをDBに記録"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR IGNORE INTO discord_messages (message_id, posted_at) VALUES (?, ?)",
+                    (str(message_id), datetime.now().isoformat()),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to record Discord message ID: {e}")
+
+    def _get_meta(self, key):
+        """metaテーブルから値を取得"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
+                result = cursor.fetchone()
+                return result[0] if result else None
+        except sqlite3.Error:
+            return None
+
+    def _set_meta(self, key, value):
+        """metaテーブルに値を記録"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to write meta '{key}': {e}")
+
+    def _delete_discord_message(self, message_id):
+        """webhook経由で古いDiscordメッセージを削除する。成功時True"""
+        for _ in range(3):
+            try:
+                response = requests.delete(
+                    self._discord_delete_url(message_id), timeout=30
+                )
+                if response.status_code == 429:
+                    try:
+                        retry_after = float(response.json().get("retry_after", "1"))
+                    except ValueError:
+                        retry_after = 1.0
+                    self.logger.warning(
+                        f"Rate limited while deleting message {message_id}, waiting {retry_after}s"
+                    )
+                    time.sleep(retry_after)
+                    continue
+                if response.status_code == 404:
+                    return True
+                response.raise_for_status()
+                return True
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(
+                    f"Failed to delete Discord message {message_id}: {e}"
+                )
+                time.sleep(1)
+        return False
+
+    def _cleanup_old_discord_messages(self, force=False):
+        """保持件数を超えた古いDiscordメッセージをwebhook経由で削除する。"""
+        if not self.discord_webhook_url:
+            return
+
+        last_cleanup = self._get_meta("last_discord_cleanup")
+        if not force and last_cleanup:
+            try:
+                elapsed_hours = (
+                    datetime.now() - datetime.fromisoformat(last_cleanup)
+                ).total_seconds() / 3600
+                if elapsed_hours < self.discord_cleanup_interval_hours:
+                    return
+            except ValueError:
+                pass
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT message_id FROM discord_messages
+                    ORDER BY posted_at DESC, rowid DESC
+                    LIMIT -1 OFFSET ?
+                    """,
+                    (max(self.discord_keep_messages, 0),),
+                )
+                stale_ids = [row[0] for row in cursor.fetchall()]
+
+            if not stale_ids:
+                self.logger.info(
+                    f"Discord message retention check: within limit ({self.discord_keep_messages})"
+                )
+                self._set_meta("last_discord_cleanup", datetime.now().isoformat())
+                return
+
+            self.logger.info(
+                f"Deleting {len(stale_ids)} old Discord messages (keep={self.discord_keep_messages})"
+            )
+            deleted = 0
+            for message_id in stale_ids:
+                if self._delete_discord_message(message_id):
+                    deleted += 1
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute(
+                            "DELETE FROM discord_messages WHERE message_id = ?",
+                            (message_id,),
+                        )
+                time.sleep(self.discord_delete_interval_seconds)
+
+            self.logger.info(f"Deleted {deleted}/{len(stale_ids)} old Discord messages")
+            self._set_meta("last_discord_cleanup", datetime.now().isoformat())
+        except sqlite3.Error as e:
+            self.logger.error(f"Database error during Discord message cleanup: {e}")
 
     def fetch_abnormal_funding_rates(self):
         """CMMA APIから異常なFunding Rateデータを取得"""
@@ -388,11 +542,17 @@ class CmmaFundingRateMonitor:
         payload = {"embeds": [embed]}
 
         try:
-            response = requests.post(self.discord_webhook_url, json=payload, timeout=30)
+            response = requests.post(self._discord_post_url(), json=payload, timeout=30)
             response.raise_for_status()
             self.logger.info(
                 f"Sent Discord notification for {len(notifications)} symbols."
             )
+            try:
+                message_id = response.json().get("id")
+                if message_id:
+                    self._record_discord_message(message_id)
+            except ValueError:
+                self.logger.warning("Discord response did not contain a message id")
 
             # DBに記録
             for n in notifications:
@@ -410,6 +570,7 @@ class CmmaFundingRateMonitor:
     def monitor(self):
         """監視実行"""
         self.logger.info("Starting funding rate check...")
+        self._cleanup_old_discord_messages()
 
         # 1. 異常値をフェッチ
         candidates = self.fetch_abnormal_funding_rates()
