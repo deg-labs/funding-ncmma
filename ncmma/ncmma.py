@@ -19,6 +19,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+import discord_retention as retention
 
 
 class CmmaFundingRateMonitor:
@@ -90,6 +91,10 @@ class CmmaFundingRateMonitor:
             os.getenv("DISCORD_DELETE_INTERVAL_SECONDS", "0.5")
         )
 
+        self.discord_message_max_age_hours = retention.max_age_hours(
+            os.getenv("DISCORD_MESSAGE_MAX_AGE_HOURS", "0")
+        )
+
         # ログ設定
         self.log_max_size_mb = int(os.getenv("LOG_MAX_SIZE_MB", "10"))
 
@@ -121,6 +126,7 @@ class CmmaFundingRateMonitor:
                         value TEXT NOT NULL
                     )
                 """)
+                retention.ensure_schema(conn)
                 conn.commit()
         except sqlite3.Error as e:
             self.logger.error(f"Database initialization failed: {e}")
@@ -146,16 +152,14 @@ class CmmaFundingRateMonitor:
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.INFO)
 
-        # コンソールハンドラー
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.INFO)
+        console_handlers = retention.console_handlers(formatter)
 
         # ロガー設定
         self.logger = logging.getLogger("CmmaFundingRateMonitor")
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
+        for handler in console_handlers:
+            self.logger.addHandler(handler)
         self.logger.propagate = False
 
     def _generate_notification_hash(self, symbol, direction):
@@ -210,30 +214,17 @@ class CmmaFundingRateMonitor:
             self.logger.error(f"Failed to record notification to DB: {e}")
 
     def _discord_post_url(self):
-        """wait=true を付けた投稿用URLを返す (レスポンスからメッセージIDを取得するために必要)"""
-        base, sep, query = self.discord_webhook_url.partition("?")
-        if sep:
-            return f"{base}?{query}&wait=true"
-        return f"{base}?wait=true"
+        return retention.post_url(self.discord_webhook_url)
 
-    def _discord_delete_url(self, message_id):
-        """webhookが投稿したメッセージを削除するURLを返す"""
-        base, sep, query = self.discord_webhook_url.partition("?")
-        url = f"{base}/messages/{message_id}"
-        return f"{url}?{query}" if sep else url
+    def _discord_delete_url(self, message_id, webhook_url=None):
+        return retention.message_url(
+            webhook_url or self.discord_webhook_url, message_id
+        )
 
     def _record_discord_message(self, message_id):
-        """投稿したDiscordメッセージのIDをDBに記録"""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT OR IGNORE INTO discord_messages (message_id, posted_at) VALUES (?, ?)",
-                    (str(message_id), datetime.now().isoformat()),
-                )
-                conn.commit()
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to record Discord message ID: {e}")
+        retention.record_message(
+            self.db_path, message_id, self.discord_webhook_url, self.logger
+        )
 
     def _get_meta(self, key):
         """metaテーブルから値を取得"""
@@ -259,88 +250,118 @@ class CmmaFundingRateMonitor:
         except sqlite3.Error as e:
             self.logger.error(f"Failed to write meta '{key}': {e}")
 
-    def _delete_discord_message(self, message_id):
-        """webhook経由で古いDiscordメッセージを削除する。成功時True"""
+    def _delete_discord_message(self, message_id, webhook_url=None):
+        url = self._discord_delete_url(message_id, webhook_url)
         for _ in range(3):
             try:
-                response = requests.delete(
-                    self._discord_delete_url(message_id), timeout=30
-                )
-                if response.status_code == 429:
-                    try:
-                        retry_after = float(response.json().get("retry_after", "1"))
-                    except ValueError:
-                        retry_after = 1.0
-                    self.logger.warning(
-                        f"Rate limited while deleting message {message_id}, waiting {retry_after}s"
-                    )
-                    time.sleep(retry_after)
-                    continue
-                if response.status_code == 404:
+                response = requests.delete(url, timeout=30)
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                if retention.deletion_confirmed(response.status_code, body):
                     return True
-                response.raise_for_status()
-                return True
-            except requests.exceptions.RequestException as e:
+                if response.status_code == 429:
+                    time.sleep(retention.retry_delay(body))
+                    continue
                 self.logger.warning(
-                    f"Failed to delete Discord message {message_id}: {e}"
+                    "Discord delete deferred id=%s status=%s code=%s",
+                    message_id,
+                    response.status_code,
+                    retention.error_code(body),
                 )
-                time.sleep(1)
+                if response.status_code < 500:
+                    return False
+            except requests.exceptions.RequestException as error:
+                self.logger.warning(
+                    "Discord delete deferred id=%s error_type=%s",
+                    message_id,
+                    type(error).__name__,
+                )
+            except (TypeError, ValueError):
+                self.logger.warning("Invalid Discord retry response id=%s", message_id)
+                return False
+            time.sleep(1)
         return False
 
     def _cleanup_old_discord_messages(self, force=False):
-        """保持件数を超えた古いDiscordメッセージをwebhook経由で削除する。"""
         if not self.discord_webhook_url:
             return
-
-        last_cleanup = self._get_meta("last_discord_cleanup")
-        if not force and last_cleanup:
-            try:
-                elapsed_hours = (
-                    datetime.now() - datetime.fromisoformat(last_cleanup)
-                ).total_seconds() / 3600
-                if elapsed_hours < self.discord_cleanup_interval_hours:
-                    return
-            except ValueError:
-                pass
-
+        recovered = retention.recover_pending(self.db_path, self.logger)
+        max_age = getattr(self, "discord_message_max_age_hours", 0)
+        interval = (
+            min(self.discord_cleanup_interval_hours, 5 / 60)
+            if max_age
+            else self.discord_cleanup_interval_hours
+        )
+        if not force and not retention.cleanup_due(
+            self._get_meta("last_discord_cleanup"), interval
+        ):
+            return
         try:
             with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT message_id FROM discord_messages
-                    ORDER BY posted_at DESC, rowid DESC
-                    LIMIT -1 OFFSET ?
-                    """,
-                    (max(self.discord_keep_messages, 0),),
-                )
-                stale_ids = [row[0] for row in cursor.fetchall()]
-
-            if not stale_ids:
-                self.logger.info(
-                    f"Discord message retention check: within limit ({self.discord_keep_messages})"
-                )
-                self._set_meta("last_discord_cleanup", datetime.now().isoformat())
-                return
-
-            self.logger.info(
-                f"Deleting {len(stale_ids)} old Discord messages (keep={self.discord_keep_messages})"
-            )
+                rows = conn.execute("""SELECT message_id, posted_at, webhook_url
+                    FROM discord_messages ORDER BY posted_at DESC, rowid DESC""").fetchall()
+            stale = retention.stale_rows(rows, self.discord_keep_messages, max_age)
+            complete = recovered
             deleted = 0
-            for message_id in stale_ids:
-                if self._delete_discord_message(message_id):
-                    deleted += 1
+            for message_id, posted_at, webhook_url in stale:
+                if not webhook_url:
+                    # Legacy IDs must be proven to belong to the configured webhook.
+                    try:
+                        response = requests.get(
+                            self._discord_delete_url(message_id), timeout=30
+                        )
+                        body = response.json()
+                        if (
+                            response.status_code != 200
+                            or not retention.legacy_message_matches(
+                                body, message_id, self.discord_webhook_url
+                            )
+                        ):
+                            self.logger.warning(
+                                "Discord legacy route unverified id=%s status=%s",
+                                message_id,
+                                response.status_code,
+                            )
+                            complete = False
+                            continue
+                        webhook_url = self.discord_webhook_url
+                        with sqlite3.connect(self.db_path) as conn:
+                            conn.execute(
+                                "UPDATE discord_messages SET webhook_url=? WHERE message_id=?",
+                                (webhook_url, message_id),
+                            )
+                    except (requests.exceptions.RequestException, ValueError):
+                        self.logger.warning(
+                            "Discord legacy route lookup failed id=%s", message_id
+                        )
+                        complete = False
+                        continue
+                if self._delete_discord_message(message_id, webhook_url):
                     with sqlite3.connect(self.db_path) as conn:
                         conn.execute(
-                            "DELETE FROM discord_messages WHERE message_id = ?",
+                            "DELETE FROM discord_messages WHERE message_id=?",
                             (message_id,),
                         )
+                    deleted += 1
+                else:
+                    complete = False
                 time.sleep(self.discord_delete_interval_seconds)
-
-            self.logger.info(f"Deleted {deleted}/{len(stale_ids)} old Discord messages")
-            self._set_meta("last_discord_cleanup", datetime.now().isoformat())
-        except sqlite3.Error as e:
-            self.logger.error(f"Database error during Discord message cleanup: {e}")
+            if complete:
+                self._set_meta(
+                    "last_discord_cleanup", datetime.now().astimezone().isoformat()
+                )
+            self.logger.info(
+                "Discord cleanup deleted=%s candidates=%s complete=%s",
+                deleted,
+                len(stale),
+                complete,
+            )
+        except sqlite3.Error as error:
+            self.logger.error(
+                "Discord cleanup DB failure error_type=%s", type(error).__name__
+            )
 
     def fetch_abnormal_funding_rates(self):
         """CMMA APIから異常なFunding Rateデータを取得"""
@@ -548,11 +569,17 @@ class CmmaFundingRateMonitor:
                 f"Sent Discord notification for {len(notifications)} symbols."
             )
             try:
-                message_id = response.json().get("id")
-                if message_id:
-                    self._record_discord_message(message_id)
+                body = response.json()
+                message_id = body.get("id") if isinstance(body, dict) else None
+                if not message_id:
+                    self.logger.error(
+                        "Discord POST returned no message ID; delivery cannot be tracked"
+                    )
+                    return False
+                self._record_discord_message(message_id)
             except ValueError:
-                self.logger.warning("Discord response did not contain a message id")
+                self.logger.error("Discord POST returned an invalid message ID")
+                return False
 
             # DBに記録
             for n in notifications:
@@ -564,7 +591,9 @@ class CmmaFundingRateMonitor:
                 )
             return True
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Failed to send Discord notification: {e}")
+            self.logger.error(
+                "Discord send outcome uncertain error_type=%s", type(e).__name__
+            )
             return False
 
     def monitor(self):
@@ -601,7 +630,7 @@ def main():
         print("Process interrupted.")
         sys.exit(0)
     except Exception as e:
-        print(f"Critical Error: {e}")
+        print(f"Critical Error: {e}", file=sys.stderr)
         import traceback
 
         traceback.print_exc()
